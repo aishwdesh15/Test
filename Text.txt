@@ -1,0 +1,413 @@
+"""
+ Utils class for de_identify retokenizing cement app.
+"""
+import csv
+import os
+import subprocess
+import uuid
+import getpass
+import yaml
+import traceback
+
+from cement.utils.misc import minimal_logger
+from ..services.service_metadata_logger import ServiceMetadataLogger
+from ..core.ec2_utils import get_ec2_instance_id
+
+LOG = minimal_logger(__name__)
+
+TEMP_DEID_OUTPUT_S3_BUCKET_PATH = os.environ.get("TEMP_DEID_OUTPUT_S3_BUCKET_PATH")
+DATAVANT_RETOKENIZER_THREAD_COUNT = os.environ.get("DATAVANT_RETOKENIZER_THREAD_COUNT", 8)
+ALL_DEID_COLUMNS = ['PERSON_FIRST_NAME', 'PERSON_MIDDLE_INITIAL', 'PERSON_LAST_NAME', 'DOB', 'ZIP',
+                    'GENDER', 'RECORD_ID']
+
+
+class DatavantRunner:
+    def __init__(self, target_s3_path):
+        self.target_s3_path = target_s3_path
+
+    def run(self, iterator):
+        """ retokenize iterable definition, returns iterable & partitioned retokenized output. """
+
+        unique_id = f"{get_ec2_instance_id()}_{uuid.uuid4()}"
+        input_file = f"{unique_id}.csv"
+        tokenized_output_file = f"{unique_id}_out.csv"
+
+        # Create a Local File for the Data Spark Frame Partition
+        create_retokenization_input(input_file, iterator)
+        self.retokenize_file(input_file)
+
+        print(f"Tokenization complete - {tokenized_output_file}")
+
+        # Upload to S3 if S3 Path is provided.
+        if self.target_s3_path is not None:
+            self.upload_file_to_s3(tokenized_output_file)
+
+        return iter([0])
+
+    def upload_file_to_s3(self, output_file):
+        import boto3
+        from urllib.parse import urlparse
+
+        # Compress Retokenized/Deidentified file
+        subprocess.Popen(["gzip", output_file]).communicate()
+
+        tokenized_output_file_gz = f"{output_file}.gz"
+        tokenized_output_file_gz_path = f"{os.getcwd()}/{tokenized_output_file_gz}"
+        LOG.info(f"Tokenized output file gz path is - {tokenized_output_file_gz_path}")
+
+        url_parts = urlparse(self.target_s3_path)
+        s3_path = boto3.client("s3")
+        LOG.info(f"Uploading to {self.target_s3_path}")
+        s3_path.upload_file(tokenized_output_file_gz_path, url_parts.netloc,
+                            f"{url_parts.path[1:]}/{tokenized_output_file_gz}")
+
+        # Clean up tokenized files after s3 upload.
+        os.remove(tokenized_output_file_gz_path)
+
+        LOG.info(f"uploaded {tokenized_output_file_gz_path} to {self.target_s3_path}")
+
+    def create_datavant_command(self, deid_config, input_file):
+        pass
+
+    def retokenize_file(self, input_file):
+        """ retokenize locally single input file definition. """
+        deid_config = load_deid_config()
+        if input_file.endswith(".gz"):
+            LOG.info(f"Decompressing {input_file}")
+            subprocess.Popen(["gunzip", input_file]).communicate()
+            input_file = input_file.split(".gz")[0]
+
+        LOG.info(f"Retokenizing {input_file}")
+        retokenize_command = self.create_datavant_command(deid_config, input_file)
+        process = subprocess.Popen(retokenize_command, stdin=subprocess.PIPE,
+                                   stdout=open("link.log", "w"), stderr=open("link-error.log", "w"))
+        process.communicate(deid_config['LINK_PASSWORD'].encode())
+
+        retokenized_file = f"{input_file.split('.csv')[0]}_out.csv"
+        LOG.info(f"Retokenization completed to {retokenized_file}")
+
+        return retokenized_file
+
+
+class DeIdentifier(DatavantRunner):
+    def __init__(self, target_s3_path, datavant_config):
+        super().__init__(target_s3_path)
+        self.datavant_config = datavant_config
+
+    def create_datavant_command(self, deid_config, input_file):
+        LOG.info(f"running deid dv command for datavant_config param - {self.datavant_config}")
+        return [
+            deid_config['DEID_EXEC_PATH'], "-a", get_deid_config_path(), "-s", deid_config['LINK_SITE'],
+            "-c", self.datavant_config if self.datavant_config is not None else deid_config['DEFAULT_DEID_CONFIG_NAME'],
+            "-i", input_file,
+            "-o", "./",
+            "-p", "--num-threads", "5"
+        ]
+
+
+def get_deid_config_path():
+    """ de_identify config path definition, returns config yaml file path. """
+    deid_config_path = os.environ.get('DEID_CONFIG_PATH')
+    if deid_config_path is None:
+        return f"/home/{getpass.getuser()}/deid_config.yaml"
+
+    return deid_config_path
+
+
+def create_retokenization_input(file_name, iterable):
+    """ Creates a key-value paired input file. """
+    with open(file_name, mode='w') as input_csv:
+        input_csv_writer = csv.writer(input_csv, delimiter=',', quotechar='"',
+                                      quoting=csv.QUOTE_NONNUMERIC)
+        # Read First row from Collection
+        first_row = next(iterable)
+        # Create a Header Record from first row Keys.
+        input_csv_writer.writerow(first_row.asDict().keys())
+        # Write the first Row to CSV
+        input_csv_writer.writerow(first_row)
+        # Write All remaining rows to CSV
+        input_csv_writer.writerows(iterable)
+        input_csv.close()
+
+
+def load_deid_config():
+    """ load deid config definition, returns a loaded deid config yaml file. """
+    return yaml.load(open(get_deid_config_path()), Loader=yaml.FullLoader)
+
+
+class Retokenizer(DatavantRunner):
+    def __init__(self, target_s3_path):
+        super().__init__(target_s3_path)
+
+    def create_datavant_command(self, deid_config, input_file):
+        """ datavant command definition.
+                    Parameters
+                        deid_config : yaml config file
+                        input_file : input file passed for retokenizing
+                    Returns: built and configured retokenize command.
+            """
+        return [
+            deid_config['LINK_EXEC_PATH'], "-a", get_deid_config_path(), "-s", deid_config['LINK_SITE'],
+            "-i", input_file,
+            "-o", "./",
+            "-p", "--receive-from", deid_config['LINK_DATA_VENDOR'], "--num-threads",
+            f"{DATAVANT_RETOKENIZER_THREAD_COUNT}"
+        ]
+
+
+class Boto3BasedRetokenizer(Retokenizer):
+    def __init__(self, target_s3_path, data_fabric_bucket):
+        super().__init__(target_s3_path)
+        from ..data_fabric_client import DataFabricClient
+
+        self.data_fabric_bucket = data_fabric_bucket
+        self.data_fabric_client = DataFabricClient()
+
+    def run(self, iterator):
+        from pyspark.sql import Row
+        from ..core.s3_utils import upload_file
+
+        partition = str(uuid.uuid4())
+        files = []
+        for row in iterator:
+            LOG.info(f"Boto3 based retokenizer will retokenize {row['value']} - partition - {partition}")
+            files.append(row['value'])
+            file_name = self.download_data_fabric_file()
+            self.retokenize_file(file_name)
+            upload_file(file_name)
+
+        return iter([Row(id=partition, files=files)])
+
+    def download_data_fabric_file(self, data):
+        data_fabric_response = self.data_fabric_client.call_read_role_direct()
+        return None
+
+
+def retokenize_on_spark_s3(s3_input_path, s3_output_path):
+    """
+        Retokenize files (RAW CMD Data) globbed by s3_input_path parameter using Datavant Software.
+        Each partition is retokenized with a mapper.
+        The mapper retokenizes and uploads the output to s3_output_path.
+    """
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.builder.getOrCreate()
+    untokenized_raw_input = spark. \
+        read. \
+        format("csv"). \
+        options(header='true', inferSchema='true'). \
+        load(s3_input_path)
+
+    retokenizer = Retokenizer(s3_output_path)
+    # Count is called so that spark can execute the partition processing,
+    # without an action spark doesn't evaluate the DAG.
+    untokenized_raw_input.rdd.mapPartitions(retokenizer.run).count()
+
+
+def data_fabric_to_s3(package, dataset, request, target_s3_path, add_extract_date=False):
+    """
+        Copy data fabric data to given s3 bucket path
+    """
+    from ..data_fabric_utils import DataFabricSparkDataSource
+
+    # Read data from Data Fabric
+    LOG.info(f"Reading data from data fabric package - {package} and dataset - {dataset}")
+    data_fabric_data_source = DataFabricSparkDataSource(None)
+    partition = get_partition_value(request)
+
+    cmd_raw_input = read_data_fabric_data_and_add_extract_date(package, dataset, ',', partition) if add_extract_date \
+        else \
+        data_fabric_data_source.read(package, dataset, partition,
+                                     delimiter=',', header='true',
+                                     inferSchema='false')
+
+    # write the data to s3 path provided
+    LOG.info(f"Writing the data fabric data to s3 path - {target_s3_path}")
+    cmd_raw_input.write.options(header='true').mode("overwrite").csv(target_s3_path, compression="gzip")
+
+
+def retokenize_on_spark_s3_input(input_s3_path, package, dataset, tmp_cmd_bucket_name, output_schema, output_table):
+    from ..spark_apps.spark_datasource import S3SparkDataSource
+
+    s3_data_source = S3SparkDataSource(None)
+    untokenized_raw_input = s3_data_source.read(path=input_s3_path, infer_schema='true', delimiter='|')
+    untokenized_raw_input.show()
+    LOG.info(f"Untokenized raw cmd input count for - {dataset} is {untokenized_raw_input.count()}")
+    retokenize_on_spark(package, dataset, untokenized_raw_input, tmp_cmd_bucket_name, output_schema, output_table)
+
+
+def retokenize_on_spark_datafabric_input(package, dataset, request, delimiter, tmp_cmd_bucket_name, output_schema,
+                                         output_table):
+    partition = get_partition_value(request)
+    untokenized_raw_input = read_data_fabric_data_and_add_extract_date(package, dataset, delimiter, partition)
+    LOG.info(f"Untokenized raw cmd input count for - {dataset} is {untokenized_raw_input.count()}")
+    retokenize_on_spark(package, dataset, untokenized_raw_input, tmp_cmd_bucket_name, output_schema, output_table)
+
+
+def retokenize_on_spark_datafabric_input2(package, dataset, request, tmp_cmd_bucket_name, output_schema,
+                                          output_table):
+    from .data_fabric_files_crawler import crawl
+    from usdataecosystem.spark_apps.de_identify_spark import Retokenizer
+    from ..core.snowflake_utils import copy_data_from_s3_to_snowflake
+    from ..core.s3_utils import delete_s3_folder
+
+    LOG.info(f"retokenize_on_spark_datafabric_input using Boto3 based data fabric reader - {package}/{dataset}")
+
+    retokenizer = Retokenizer(None)
+    extract_date = get_partition_value(request)
+    retokenized_path = crawl(package, dataset, tmp_cmd_bucket_name, extract_date=extract_date,
+                             file_handler=retokenizer.retokenize_file)
+    retokenized_s3_path = f"s3://{tmp_cmd_bucket_name}/{retokenized_path}"
+
+    copy_data_from_s3_to_snowflake(retokenized_s3_path, output_schema, output_table)
+    delete_s3_folder(retokenized_s3_path)
+
+
+def retokenize_on_spark(package, dataset, untokenized_raw_input, tmp_cmd_bucket_name, output_schema, output_table):
+    """
+        Retokenize files (RAW CMD Data) globed by package, dataset and delimiter parameters using Datavant Software.
+        Each partition is retokenized with a mapper.
+        The mapper retokenizes and uploads the output to temporary cmd bucket name.
+    """
+    from ..core.s3_utils import delete_s3_folder
+    from ..core.snowflake_utils import copy_data_from_s3_to_snowflake
+
+    try:
+        unique_request_id = uuid.uuid4()
+        tmp_cmd_s3_output_path = f"s3://{tmp_cmd_bucket_name}/{package}/{dataset}/{unique_request_id}"
+
+        retokenizer = Retokenizer(tmp_cmd_s3_output_path)
+        untokenized_raw_input.rdd.mapPartitions(retokenizer.run).count()
+
+        copy_data_from_s3_to_snowflake(tmp_cmd_s3_output_path, output_schema, output_table)
+
+        LOG.info(f"Deleting the temporary s3 folder path - {tmp_cmd_s3_output_path}")
+        delete_s3_folder(tmp_cmd_s3_output_path)
+
+    except Exception as ex:
+        LOG.warning(f"Error while processing the Retokenization - {ex.args[0]}")
+        raise Exception(f"Error while processing the Retokenization - {ex.args[0]}")
+
+
+def read_data_fabric_data_and_add_extract_date(package, dataset, delimiter, partition):
+    """
+        Reads the data from data fabric package and dataset with/without partition and adds extract_date column to it
+    """
+    from ..data_fabric_utils import DataFabricSparkDataSource
+    from ..core.cmd_utils import add_cmd_extract_date
+
+    data_fabric_data_source = DataFabricSparkDataSource(None)
+
+    LOG.info(f"Reading the data from data fabric package - {package}, dataset - {dataset}, partition - {partition}")
+
+    untokenized_raw_input = data_fabric_data_source.read(package, dataset, partition,
+                                                         delimiter=delimiter, header='true',
+                                                         inferSchema='false')
+
+    LOG.info("Adding the Extract date column to data fabric data")
+
+    return add_cmd_extract_date(untokenized_raw_input)
+
+
+def get_partition_value(request):
+    """
+        Gets the partition value based on the request value passed.
+    """
+    LOG.info(f"get_partition_value from {request}")
+    if request and ":" in request:
+        partition_value = request.split(":")[1]
+        partition = f"EXTRACT_DATE={partition_value}"
+    else:
+        partition = None
+
+    LOG.info(f"partition_value from {request} is {partition}")
+    return partition
+
+
+def validate_deidentify_columns(data):
+    """
+        perform validation for De-identify service provided input columns
+    """
+    valid_columns = False
+    columns_list = data.columns
+    if len(list(set(columns_list) & set(ALL_DEID_COLUMNS))) == 7:
+        LOG.debug(f"VALID DE-IDENTIFY COLUMNS ARE PASSED - {ALL_DEID_COLUMNS}")
+        valid_columns = True
+    return valid_columns
+
+
+def get_missing_deidentify_columns(columns):
+    """
+        gives the missing de-identify columns for the input dataset
+    """
+    missing_col = set(ALL_DEID_COLUMNS) - (set(columns) & set(ALL_DEID_COLUMNS))
+    return missing_col
+
+
+def deidentify_on_spark(request_id, input_schema, input_table, output_schema, datavant_config, datasource, email_id):
+    """
+        deidentify pii data on emr spark cluster.
+    """
+
+    from .spark_datasource import get_spark_datasource
+    from ..core.s3_utils import delete_s3_folder
+    from ..core.smtp_utils import send_email
+
+    try:
+
+        if not TEMP_DEID_OUTPUT_S3_BUCKET_PATH:
+            raise Exception("TEMP_DEID_OUTPUT_S3_BUCKET_PATH not configured as env var.")
+
+        # Get data spark source impln for s3 or snowflake
+        spark_datasource = get_spark_datasource(datasource)
+
+        # read the pii input data for to be de_identified.
+        pii_input_data = spark_datasource.read(input_schema, input_table)
+
+        if validate_deidentify_columns(pii_input_data):
+            # Create a de_identifier to write the output to temp s3 location.
+            output_table = f"{str(input_table).upper()}_DV_TOKENS"
+            temp_s3_output_path = f"{TEMP_DEID_OUTPUT_S3_BUCKET_PATH}/{output_schema}/{output_table}/{request_id}"
+            deIdentifier = DeIdentifier(temp_s3_output_path, datavant_config)
+
+            # Select only the Datavant required columns from input data
+            deid_pii_df = pii_input_data.select(*ALL_DEID_COLUMNS)
+
+            # De_identify using partition processing. Count is called to force an action on DAG.
+            deid_pii_df.rdd.mapPartitions(deIdentifier.run).count()
+
+            # Read de_identified data from temp S3 location.
+            s3_spark_datasource = get_spark_datasource("s3")
+            de_identified_pii_data = s3_spark_datasource.read(path=temp_s3_output_path)
+
+            # Write output to target schema/table in s3 or snowflake
+            spark_datasource.write(de_identified_pii_data, output_schema, output_table)
+            # Delete temp s3 output
+            delete_s3_folder(temp_s3_output_path)
+
+            # Update service request status.
+            service_metadata_logger = ServiceMetadataLogger()
+            service_metadata_logger.update_service_request(request_id, status='COMPLETED', output_schema=output_schema,
+                                                           output_table=output_table)
+            if email_id != 'None':
+                send_email(f"Service request for De-identify completed Successfully! "
+                           f"Output table (schema/table) is - {output_schema}/{output_table}", email_id)
+        else:
+            error_message = f"Required De-identify PII columns are missing - " \
+                            f"{get_missing_deidentify_columns(pii_input_data.columns)}"
+            LOG.debug(f"Required De-identify PII columns are missing - "
+                      f"{get_missing_deidentify_columns(pii_input_data.columns)}")
+            service_metadata_logger = ServiceMetadataLogger()
+            service_metadata_logger.update_service_request(request_id, status='FAILED', error_message=error_message)
+            if email_id != 'None':
+                send_email(f"Service request for De-identify FAILED and the error message is-{error_message}", email_id)
+
+    except Exception as ex:
+        LOG.debug(f"Error while de-identifying PII data on spark - {ex.args[0]}")
+        traceback.print_exc()
+        service_metadata_logger = ServiceMetadataLogger()
+        service_metadata_logger.update_service_request(request_id, status='FAILED', error_message=ex.args[0])
+        if email_id != 'None':
+            send_email(f"Service request for De-identify FAILED with generic exception "
+                       f"and the error message is - {ex.args[0]}", email_id)
+
